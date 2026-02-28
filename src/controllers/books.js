@@ -1,7 +1,37 @@
 import Books from '../models/books.js';
 import multer from 'multer';
 import multerS3 from 'multer-s3';
-import AWS from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import config from '../../config.js';
+
+const s3 = new S3Client({
+    credentials: {
+        accessKeyId: config.aws.accessKeyId,
+        secretAccessKey: config.aws.secretAccessKey
+    },
+    region: config.aws.region
+});
+
+const upload = multer({
+    storage: multerS3({
+        s3: s3,
+        bucket: config.aws.bucketName,
+        key: (req, file, cb) => {
+            cb(null, `books/${Date.now()}-${file.originalname}`);
+        }
+    })
+});
+
+const uploadCoverImage = (req, res) => new Promise((resolve, reject) => {
+    upload.single('coverImage')(req, res, (err) => {
+        if (err) {
+            reject(err);
+            return;
+        }
+        resolve();
+    });
+});
 
 const getAll = async (req, res) => {
     try {
@@ -46,16 +76,30 @@ const getAll = async (req, res) => {
 const getById = async (req, res) => {
     try {
         const bookId = req.params.id;
-        const book = await Books.findById(bookId).populate('reviewsData');
+        const book = await Books.findById(bookId);
+        // const book = await Books.findById(bookId).populate('reviewsData');
 
         if (!book) {
             res.status(404).json({ status: false, message: 'Book not found' });
             return;
         }
 
+        if (book.coverImage) {
+            const coverImageKey = book.coverImage.includes('.amazonaws.com/')
+                ? book.coverImage.split('.amazonaws.com/')[1]
+                : book.coverImage;
+
+            const command = new GetObjectCommand({
+                Bucket: config.aws.bucketName,
+                Key: coverImageKey
+            });
+
+            book.coverImage = await getSignedUrl(s3, command, { expiresIn: 3600 });
+        }
+
         res.status(200).json({ status: true, message: 'Book details', data: book });
     } catch (error) {
-        res.status(500).json({ status: false, message: 'Failed to fetch book' });
+        res.status(500).json({ status: false, message: 'Failed to fetch book', error: error.message });
     }
 };
 
@@ -66,6 +110,8 @@ const add = async (req, res) => {
             return;
         }
 
+        await uploadCoverImage(req, res);
+
         const doc = {
             title: req.body.title,
             excerpt: req.body.excerpt,
@@ -74,41 +120,19 @@ const add = async (req, res) => {
             category: req.body.category,
             subcategory: req.body.subcategory,
             releasedAt: req.body.releasedAt
+        };
+
+        if (req.file) {
+            doc.coverImage = req.file.location;
         }
-        
-        const s3 = new AWS.S3Client({
-            credentials: {
-            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-            },
-            region: process.env.AWS_REGION
-        });
-
-        const upload = multer({
-            storage: multerS3({
-                s3: s3,
-                bucket: process.env.AWS_S3_BUCKET,
-                acl: 'public-read',
-                key: (req, file, cb) => {
-                    cb(null, `books/${Date.now()}-${file.originalname}`);
-                }
-            })
-        });
-
-        upload.single('bookCover')(req, res, async (err) => {
-            if (err) {
-                return res.status(500).json({ status: false, message: 'File upload failed' });
-            }
-            
-            if (req.file) {
-                doc.bookCover = req.file.location;
-            }
-        });
         
         const newBook = await Books.create(doc);
         res.status(201).json({ status: true, message: 'Book created successfully', data: newBook });
     } catch (error) {
-        res.status(500).json({ status: false, message: 'Failed to create book' });
+        const message = error?.message?.toLowerCase()?.includes('upload')
+            ? 'File upload failed'
+            : 'Failed to create book';
+        res.status(500).json({ status: false, message, error: error.message });
     }
 };
 
